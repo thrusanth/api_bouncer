@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import Dict, Optional
 from datetime import datetime
 import uuid
+import traceback
 
 app = FastAPI(title="Realogram API Bouncer", description="Edge CV Format Violation Interceptor & Reconciliation Engine")
 
@@ -12,6 +13,9 @@ reconciliation_logs = []
 # --- Enterprise Security Token ---
 VALID_EDGE_TOKEN = "edge-cam-prod-992-xtz"
 
+# Statutory MUP rate for alcohol in Scotland & Wales (£ per unit of alcohol)
+MUP_RATE_PER_UNIT = 0.65
+
 class ExpectedLedger(BaseModel):
     parent_sku: str
     ean: str
@@ -19,8 +23,16 @@ class ExpectedLedger(BaseModel):
     planogram_location: str
     expected_format: str
     linked_child_sku: str 
+    retail_price: float
+    pack_quantity: int
+    is_alcohol: bool = False
+    abv_strength: Optional[float] = None
+    volume_litres: Optional[float] = None
+    excise_duty: Optional[float] = None
+    vat_amount: Optional[float] = None
 
 class CVEdgeDetection(BaseModel):
+    store_region: str = "ENG"  # ENG, SCO, WAL
     parent_sku: str
     detected_quantity: int
     physical_location: str
@@ -33,6 +45,8 @@ class TransactionEnginePayload(BaseModel):
     transaction_type: str
     reason_code: str
     ledger_adjustments: Dict[str, int] 
+    calculated_unit_price: Optional[float] = None
+    compliance_rule_applied: Optional[str] = None
 
 class LabelPrintPayload(BaseModel):
     printer_target: str
@@ -58,7 +72,10 @@ central_ledger_db = {
         expected_quantity=20, 
         planogram_location="Aisle-4-Bay-2",
         expected_format="SHRINK_WRAPPED_MULTIPACK",
-        linked_child_sku="SKU-WATER-SINGLE"
+        linked_child_sku="SKU-WATER-SINGLE",
+        retail_price=3.00,
+        pack_quantity=6,
+        is_alcohol=False
     ),
     "SKU-BEANS-4PK": ExpectedLedger(
         parent_sku="SKU-BEANS-4PK", 
@@ -66,81 +83,158 @@ central_ledger_db = {
         expected_quantity=30, 
         planogram_location="Aisle-2-Bay-4",
         expected_format="SHRINK_WRAPPED_MULTIPACK",
-        linked_child_sku="SKU-BEANS-SINGLE"
+        linked_child_sku="SKU-BEANS-SINGLE",
+        retail_price=2.40,
+        pack_quantity=4,
+        is_alcohol=False
+    ),
+    "SKU-LAGER-4PK": ExpectedLedger(
+        parent_sku="SKU-LAGER-4PK",
+        ean="5051410112233",
+        expected_quantity=15,
+        planogram_location="Aisle-4-Bay-1",
+        expected_format="SHRINK_WRAPPED_MULTIPACK",
+        linked_child_sku="SKU-LAGER-SINGLE",
+        retail_price=6.00,
+        pack_quantity=4,
+        is_alcohol=True,
+        abv_strength=4.5,
+        volume_litres=0.5,
+        excise_duty=0.45,
+        vat_amount=0.20
+    ),
+    "SKU-CIDER-4PK": ExpectedLedger(
+        parent_sku="SKU-CIDER-4PK",
+        ean="5051410223344",
+        expected_quantity=12,
+        planogram_location="Aisle-4-Bay-3",
+        expected_format="SHRINK_WRAPPED_MULTIPACK",
+        linked_child_sku="SKU-CIDER-SINGLE",
+        retail_price=4.00,
+        pack_quantity=4,
+        is_alcohol=True,
+        abv_strength=5.0,
+        volume_litres=0.5,
+        excise_duty=0.50,
+        vat_amount=0.20
+    ),
+    "SKU-BEER-10PK": ExpectedLedger(
+        parent_sku="SKU-BEER-10PK",
+        ean="5051410998877",
+        expected_quantity=10,
+        planogram_location="Aisle-4-Bay-4",
+        expected_format="SHRINK_WRAPPED_MULTIPACK",
+        linked_child_sku="SKU-BEER-SINGLE",
+        retail_price=11.00,
+        pack_quantity=10,
+        is_alcohol=True,
+        abv_strength=4.0,
+        volume_litres=0.44,
+        excise_duty=0.40,
+        vat_amount=0.18
     )
 }
 
 @app.post("/webhook/cv-detection", response_model=ShelfReconciliation)
 def process_edge_detection(payload: CVEdgeDetection, x_api_key: str = Header(None)):
-    # 1. Edge Authentication Check (The Bouncer Gatekeeper)
-    if x_api_key != VALID_EDGE_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized: Invalid Edge Camera Token")
+    try:
+        if x_api_key != VALID_EDGE_TOKEN:
+            raise HTTPException(status_code=401, detail="Unauthorized: Invalid Edge Camera Token")
 
-    if payload.confidence_score < 0.85:
-        raise HTTPException(status_code=422, detail="CV confidence too low.")
+        if payload.confidence_score < 0.85:
+            raise HTTPException(status_code=422, detail="CV confidence too low.")
 
-    ledger_data = central_ledger_db.get(payload.parent_sku)
-    if not ledger_data:
-        raise HTTPException(status_code=404, detail="SKU not found.")
+        ledger_data = central_ledger_db.get(payload.parent_sku)
+        if not ledger_data:
+            raise HTTPException(status_code=404, detail="SKU not found.")
 
-    format_alert = "PASS"
-    status_code = "SYNCED"
-    shop_floor_action = "NONE"
-    transaction_payload = None
-    label_task = None
-    
-    # 2. Generate Audit Trace ID for Idempotency & Tracking
-    audit_trace_id = f"TRX-{uuid.uuid4().hex[:8].upper()}"
+        # Default Happy Path (Perfect Sync)
+        format_alert = "PASS - Clean fill verified"
+        status_code = "SYNCED"
+        shop_floor_action = "NONE - Inventory aligned"
+        transaction_payload = None
+        label_task = None
+        
+        audit_trace_id = f"TRX-{uuid.uuid4().hex[:8].upper()}"
 
-    if payload.detected_format != ledger_data.expected_format:
-        if payload.detected_format == "TORN_MULTIPACK" and payload.loose_units_visible > 0:
-            status_code = "FORMAT_VIOLATION_TORN_PACK"
-            format_alert = f"Torn Multipack Detected! {payload.loose_units_visible} loose units exposed."
-            shop_floor_action = "DISPATCH_COLLEAGUE: Remove loose units & attach markdown label."
-            
-            # Dynamic BOM Decomposition Write-off accounting for real-world variance
-            transaction_payload = TransactionEnginePayload(
-                transaction_type="BOM_DECOMPOSITION_WRITE_OFF",
-                reason_code="DAMAGED_FORMAT_MULTIPACK_COMPROMISED",
-                ledger_adjustments={
-                    payload.parent_sku: -1, 
-                    ledger_data.linked_child_sku + "-WASTE": payload.loose_units_visible
-                }
-            )
-            
-            # Dynamic Label Generation Task for PDA / Thermal Printing
-            label_task = LabelPrintPayload(
-                printer_target=f"{payload.physical_location}-ZPL-PRINTER",
-                barcode_format="CODE128",
-                encoded_sku=ledger_data.linked_child_sku,
-                item_trace_id=audit_trace_id,
-                price_override_instruction="SINGLE_UNIT_MARKDOWN_OVERRIDE"
-            )
-        else:
-            status_code = "FORMAT_VIOLATION_GENERAL"
-            format_alert = f"Expected {ledger_data.expected_format}, found {payload.detected_format}."
-            shop_floor_action = "DISPATCH_COLLEAGUE: Correct presentation format."
+        # Override Happy Path if a violation is detected
+        if payload.detected_format != ledger_data.expected_format:
+            if payload.detected_format == "TORN_MULTIPACK" and payload.loose_units_visible > 0:
+                status_code = "FORMAT_VIOLATION_TORN_PACK"
+                format_alert = f"Torn Multipack Detected! {payload.loose_units_visible} loose units exposed."
+                shop_floor_action = "DISPATCH_COLLEAGUE: Remove loose units & attach markdown label."
+                
+                # Math Breakdown string: Retail Price / Pack Quantity
+                proportional_unit_price = ledger_data.retail_price / ledger_data.pack_quantity
+                math_display = f"£{ledger_data.retail_price:.2f} ÷ {ledger_data.pack_quantity} units = £{proportional_unit_price:.2f}"
+                
+                if ledger_data.is_alcohol:
+                    if payload.store_region == "WAL":
+                        legal_floor = MUP_RATE_PER_UNIT * ledger_data.abv_strength * ledger_data.volume_litres
+                        rule_applied = f"WALES_MUP_FLOOR (£{legal_floor:.2f}) [Math: {math_display}]"
+                    elif payload.store_region == "SCO":
+                        legal_floor = MUP_RATE_PER_UNIT * ledger_data.abv_strength * ledger_data.volume_litres
+                        rule_applied = f"SCOTLAND_MUP_FLOOR (£{legal_floor:.2f}) [Math: {math_display}]"
+                    else:
+                        legal_floor = ledger_data.excise_duty + ledger_data.vat_amount
+                        rule_applied = f"ENG_DUTY_VAT_FLOOR (£{legal_floor:.2f}) [Math: {math_display}]"
+                    
+                    final_unit_price = max(proportional_unit_price, round(legal_floor, 2))
+                else:
+                    final_unit_price = round(proportional_unit_price, 2)
+                    rule_applied = f"STANDARD_PROPORTIONAL [Math: {math_display}]"
+                
+                transaction_payload = TransactionEnginePayload(
+                    transaction_type="BOM_DECOMPOSITION_WITH_PRICING",
+                    reason_code="DAMAGED_FORMAT_PROPORTIONAL_SPLIT",
+                    ledger_adjustments={
+                        payload.parent_sku: -1, 
+                        ledger_data.linked_child_sku + "-WASTE": payload.loose_units_visible
+                    },
+                    calculated_unit_price=final_unit_price,
+                    compliance_rule_applied=rule_applied
+                )
+                
+                label_task = LabelPrintPayload(
+                    printer_target=f"{payload.physical_location}-ZPL-PRINTER",
+                    barcode_format="CODE128",
+                    encoded_sku=ledger_data.linked_child_sku,
+                    item_trace_id=audit_trace_id,
+                    price_override_instruction=f"SINGLE_UNIT_LABEL: £{final_unit_price:.2f} ({rule_applied})"
+                )
+            else:
+                status_code = "FORMAT_VIOLATION_GENERAL"
+                format_alert = f"Expected {ledger_data.expected_format}, found {payload.detected_format}."
+                shop_floor_action = "DISPATCH_COLLEAGUE: Correct presentation format."
 
-    result = ShelfReconciliation(
-        trace_id=audit_trace_id, 
-        sku=payload.parent_sku, 
-        ean=ledger_data.ean,
-        status=status_code, 
-        format_alert=format_alert,
-        shop_floor_action=shop_floor_action, 
-        transaction_engine_hook=transaction_payload,
-        label_print_task=label_task
-    )
-    reconciliation_logs.append(result)
-    return result
+        result = ShelfReconciliation(
+            trace_id=audit_trace_id, 
+            sku=payload.parent_sku, 
+            ean=ledger_data.ean,
+            status=status_code, 
+            format_alert=format_alert,
+            shop_floor_action=shop_floor_action, 
+            transaction_engine_hook=transaction_payload,
+            label_print_task=label_task
+        )
+        reconciliation_logs.append(result)
+        return result
+        
+    except Exception as e:
+        print("--- SERVER ERROR TRACEBACK ---")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def get_dashboard():
     rows = ""
     for log in reversed(reconciliation_logs):
-        tx_data = "<span class='empty-state'>N/A</span>"
+        tx_data = "<span class='empty-state'>No ledger action required (Synced)</span>"
         if log.transaction_engine_hook:
-            tx_data = f"<div class='tx-data'><strong>TxType:</strong> {log.transaction_engine_hook.transaction_type}<br><strong>Adj:</strong> {log.transaction_engine_hook.ledger_adjustments}</div>"
+            tx_data = f"<div class='tx-data'><strong>TxType:</strong> {log.transaction_engine_hook.transaction_type}<br><strong>Adj:</strong> {log.transaction_engine_hook.ledger_adjustments}"
+            if log.transaction_engine_hook.calculated_unit_price is not None:
+                tx_data += f"<br><strong>Unit Price:</strong> £{log.transaction_engine_hook.calculated_unit_price:.2f}<br><strong>Rule & Math:</strong> {log.transaction_engine_hook.compliance_rule_applied}"
+            tx_data += "</div>"
         
         label_data = ""
         if log.label_print_task:
@@ -189,7 +283,7 @@ def get_dashboard():
             .action-text {{ color: #475569; font-size: 0.9rem; }}
             .tx-data {{ background: #fff7ed; border-left: 3px solid #f97316; padding: 8px 12px; font-family: ui-monospace, monospace; font-size: 0.75rem; color: #9a3412; border-radius: 0 6px 6px 0; line-height: 1.4; margin-bottom: 4px; }}
             .label-data {{ background: #f1f5f9; border-left: 3px solid #64748b; padding: 6px 12px; font-family: ui-monospace, monospace; font-size: 0.75rem; color: #334155; border-radius: 0 6px 6px 0; }}
-            .empty-state {{ color: #94a3b8; font-style: italic; font-size: 0.9rem; }}
+            .empty-state {{ color: #94a3b8; font-style: italic; font-size: 0.85rem; padding: 4px; }}
             @media (max-width: 600px) {{ body {{ padding: 10px; }} h2 {{ font-size: 1.25rem; padding-left: 5px; }} th, td {{ padding: 12px 16px; }} }}
         </style>
     </head>
